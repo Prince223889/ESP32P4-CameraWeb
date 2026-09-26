@@ -1,145 +1,135 @@
 #include "ESP32P4CameraWeb.h"
 
-namespace {
-const char kIndexHtml[] PROGMEM = R"HTML(
-<!doctype html>
-<html lang="en">
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta charset="utf-8">
+static const char *kPage = R"HTML(<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32-P4 Camera</title>
-<style>
-:root{color-scheme:dark}body{font-family:system-ui,sans-serif;background:#101418;color:#eef2f6;margin:0;padding:14px}
-main{max-width:900px;margin:auto}.card{background:#181e24;border:1px solid #2b333c;border-radius:16px;padding:14px}
-h1{font-size:1.15rem;margin:0 0 10px}img{display:block;width:100%;height:auto;min-height:160px;background:#000;border-radius:10px;object-fit:contain}
-.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}button,select{border:0;border-radius:9px;padding:9px 12px;font:inherit}
-.status{opacity:.8;font-size:.88rem;margin-top:8px;word-break:break-word}
-</style>
-</head>
-<body>
-<main><div class="card">
-<h1>ESP32-P4 Camera</h1>
-<img id="camera" alt="Camera frame">
-<div class="row">
-<button id="shot">Take photo</button>
-<a id="save" href="/capture.bmp" download="p4-photo.bmp"><button type="button">Save image</button></a>
-<label><input id="auto" type="checkbox"> Auto</label>
-<select id="interval"><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select>
-</div>
-<div id="status" class="status">Connecting...</div>
-</div></main>
+<style>body{font-family:system-ui;margin:0;background:#111;color:#eee}main{max-width:920px;margin:auto;padding:14px}img{width:100%;height:auto;display:block;background:#000;border-radius:12px}button{padding:10px 14px;margin:8px 6px 8px 0;border:0;border-radius:9px;font-weight:600}pre{background:#1d1d1d;padding:10px;border-radius:9px;overflow:auto}</style></head>
+<body><main><h2>ESP32-P4 Camera</h2><img id="cam" alt="camera">
+<div><button onclick="snap()">Take photo</button><button onclick="toggle()" id="auto">Auto: ON</button></div>
+<pre id="status">loading...</pre>
 <script>
-const img=document.getElementById('camera');
-const statusEl=document.getElementById('status');
-const save=document.getElementById('save');
-let timer=null;
-function shot(){
-  const url='/capture.bmp?t='+Date.now();
-  statusEl.textContent='Capturing...';
-  img.onload=()=>statusEl.textContent='Frame updated';
-  img.onerror=()=>statusEl.textContent='Capture failed';
-  img.src=url;
-  save.href=url;
-}
-function arm(){
-  if(timer){clearInterval(timer);timer=null;}
-  if(document.getElementById('auto').checked){timer=setInterval(shot,Number(document.getElementById('interval').value));}
-}
-document.getElementById('shot').onclick=shot;
-document.getElementById('auto').onchange=arm;
-document.getElementById('interval').onchange=arm;
-shot();
-</script>
-</body></html>
-)HTML";
-}
+let timer=null, auto=true;
+function snap(){document.getElementById('cam').src='/snapshot.bmp?t='+Date.now();}
+function tick(){if(auto)snap();}
+function toggle(){auto=!auto;document.getElementById('auto').textContent='Auto: '+(auto?'ON':'OFF');}
+async function info(){try{let r=await fetch('/status');document.getElementById('status').textContent=await r.text();}catch(e){document.getElementById('status').textContent=e}}
+snap();info();timer=setInterval(tick,1500);
+</script></main></body></html>)HTML";
 
-ESP32P4CameraWeb::ESP32P4CameraWeb(uint16_t port) : server_(port) {}
-
-bool ESP32P4CameraWeb::begin(const char* ssid,
-                             const char* password,
-                             uint8_t i2cPort,
-                             int8_t sclPin,
-                             int8_t sdaPin,
-                             uint32_t i2cFrequency,
-                             size_t captureBuffers) {
-  if (!camera_.begin(i2cPort, sclPin, sdaPin, i2cFrequency, captureBuffers)) {
-    return false;
-  }
-  if (!startAP(ssid, password)) {
-    camera_.stop();
-    return false;
-  }
-  startServer();
-  return true;
-}
-
-bool ESP32P4CameraWeb::startAP(const char* ssid, const char* password) {
-  if (!ssid || !password || strlen(ssid) == 0 || strlen(ssid) > 32 || strlen(password) < 8) {
+bool ESP32P4CameraWeb::begin(ESP32P4Camera &camera, const char *ssid, const char *password,
+                              uint8_t channel, uint8_t maxConnections) {
+  camera_ = &camera;
+  if (!camera_->ready()) {
+    Serial.println("[ESP32P4-CameraWeb] Camera must be initialized first.");
     return false;
   }
   WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
-  const bool ok = WiFi.softAP(ssid, password);
-  if (ok) {
-    Serial.print("[WiFi] SSID: "); Serial.println(ssid);
-    Serial.print("[WiFi] IP  : "); Serial.println(WiFi.softAPIP());
+  if (!WiFi.softAP(ssid, password, channel, 0, maxConnections)) {
+    Serial.println("[ESP32P4-CameraWeb] SoftAP start failed.");
+    return false;
   }
-  return ok;
+  return startServer(80);
 }
 
-void ESP32P4CameraWeb::startServer() {
+bool ESP32P4CameraWeb::startServer(uint16_t port) {
+  port_ = port;
+  if (port != 80) {
+    // WebServer's listening port is selected by its constructor. Keep the public API
+    // simple and require the standard port for the current preview implementation.
+    Serial.println("[ESP32P4-CameraWeb] This preview uses HTTP port 80.");
+    return false;
+  }
   server_.on("/", HTTP_GET, [this]() { handleRoot(); });
-  server_.on("/capture.bmp", HTTP_GET, [this]() { handleCapture(); });
-  server_.on("/api/status", HTTP_GET, [this]() { handleStatus(); });
-  server_.onNotFound([this]() { server_.send(404, "text/plain", "Not found"); });
+  server_.on("/status", HTTP_GET, [this]() { handleStatus(); });
+  server_.on("/snapshot.bmp", HTTP_GET, [this]() { handleSnapshot(); });
+  server_.onNotFound([this]() { handleNotFound(); });
   server_.begin();
-  running_ = true;
-  Serial.println("[HTTP] Server started on port 80");
+  ready_ = true;
+  Serial.print("CAMERA_WEB_IP=");
+  Serial.println(WiFi.softAPIP().toString());
+  return true;
 }
 
-void ESP32P4CameraWeb::handleClient() {
-  if (running_) server_.handleClient();
+void ESP32P4CameraWeb::loop() {
+  if (ready_) server_.handleClient();
 }
 
 void ESP32P4CameraWeb::handleRoot() {
-  server_.send_P(200, "text/html; charset=utf-8", kIndexHtml);
+  server_.sendHeader("Cache-Control", "no-store");
+  server_.send(200, "text/html; charset=utf-8", kPage);
 }
 
 void ESP32P4CameraWeb::handleStatus() {
-  const auto& f = camera_.lastFrame();
-  char json[256];
-  snprintf(json, sizeof(json),
-           "{\"ready\":%s,\"width\":%lu,\"height\":%lu,\"bytes\":%lu,\"format\":\"%s\"}",
-           camera_.ready() ? "true" : "false",
-           static_cast<unsigned long>(f.width),
-           static_cast<unsigned long>(f.height),
-           static_cast<unsigned long>(f.size),
-           f.formatName);
+  String json = "{\"ip\":\"" + WiFi.softAPIP().toString() +
+                "\",\"width\":" + String((unsigned long)camera_->width()) +
+                ",\"height\":" + String((unsigned long)camera_->height()) +
+                ",\"frameBytes\":" + String((unsigned long)camera_->size()) + "}";
+  server_.sendHeader("Cache-Control", "no-store");
   server_.send(200, "application/json", json);
 }
 
-void ESP32P4CameraWeb::handleCapture() {
-  // The exact BMP size is known after camera capture, but WebServer's public
-  // client is a Print-like stream. We deliberately use an unknown-length
-  // response so the camera can stream the BMP directly and avoid a second
-  // full-frame copy in RAM.
-  server_.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server_.send(200, "image/bmp", "");
-
-  if (!serveBmp(server_.client())) {
-    // The HTTP header has already been sent, so only serial diagnostics are safe here.
-    Serial.println("[CameraWeb] BMP capture failed");
+void ESP32P4CameraWeb::handleSnapshot() {
+  if (!camera_->capture()) {
+    server_.send(503, "text/plain", "camera capture failed");
+    return;
   }
+  if (camera_->width() == 0 || camera_->height() == 0 || !camera_->data()) {
+    server_.send(500, "text/plain", "invalid camera frame");
+    return;
+  }
+  const uint32_t rowBytes = camera_->width() * 3u;
+  const uint32_t rowStride = (rowBytes + 3u) & ~3u;
+  const uint32_t imageBytes = rowStride * camera_->height();
+  const uint32_t total = 54u + imageBytes;
+  server_.sendHeader("Cache-Control", "no-store");
+  server_.setContentLength(total);
+  server_.send(200, "image/bmp", "");
+  Client &client = server_.client();
+  writeBmp(client);
 }
 
-bool ESP32P4CameraWeb::serveBmp(NetworkClient& client) {
-  ESP32P4Camera::FrameInfo info;
-  const bool ok = camera_.writeBMP(client, &info);
-  if (ok) {
-    Serial.print("[CameraWeb] BMP: ");
-    Serial.print(info.width); Serial.print('x'); Serial.print(info.height);
-    Serial.print(" / "); Serial.print((unsigned long)info.size); Serial.println(" bytes RGB565 input");
+void ESP32P4CameraWeb::put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+void ESP32P4CameraWeb::put32(uint8_t *p, uint32_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
+
+void ESP32P4CameraWeb::writeBmp(Client &client) {
+  const uint32_t w = camera_->width();
+  const uint32_t h = camera_->height();
+  const uint32_t rowBytes = w * 3u;
+  const uint32_t rowStride = (rowBytes + 3u) & ~3u;
+  const uint32_t imageBytes = rowStride * h;
+  uint8_t header[54] = {};
+  header[0] = 'B'; header[1] = 'M';
+  put32(header + 2, 54u + imageBytes);
+  put32(header + 10, 54u);
+  put32(header + 14, 40u);
+  put32(header + 18, w);
+  put32(header + 22, h);
+  put16(header + 26, 1);
+  put16(header + 28, 24);
+  put32(header + 34, imageBytes);
+  put32(header + 38, 2835u);
+  put32(header + 42, 2835u);
+  client.write(header, sizeof(header));
+
+  const uint8_t *src = camera_->data();
+  uint8_t *row = static_cast<uint8_t*>(malloc(rowStride));
+  if (!row) return;
+  for (int32_t y = (int32_t)h - 1; y >= 0; --y) {
+    const uint8_t *line = src + ((size_t)y * w * 2u);
+    for (uint32_t x = 0; x < w; ++x) {
+      const size_t si = (size_t)x * 2u;
+      uint16_t px = (uint16_t)line[si] | ((uint16_t)line[si+1] << 8);
+      row[x*3u + 0] = (uint8_t)((px & 0x1F) * 255 / 31);          // B
+      row[x*3u + 1] = (uint8_t)(((px >> 5) & 0x3F) * 255 / 63);  // G
+      row[x*3u + 2] = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31); // R
+    }
+    if (rowStride > rowBytes) memset(row + rowBytes, 0, rowStride - rowBytes);
+    client.write(row, rowStride);
   }
-  return ok;
+  free(row);
+}
+
+void ESP32P4CameraWeb::handleNotFound() {
+  server_.sendHeader("Location", "/", true);
+  server_.send(302, "text/plain", "redirect");
 }

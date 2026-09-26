@@ -1,26 +1,27 @@
+#include <ESP32P4Camera.h>
 #include <ESP32P4CameraWeb.h>
 
-ESP32P4CameraWeb cameraWeb;
+ESP32P4Camera camera;
+ESP32P4CameraWeb web;
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(500);
 
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println(" ESP32-P4 WEB CAMERA");
-  Serial.println("========================================");
-
-  if (!cameraWeb.begin("ESP32-P4-Camera", "12345678")) {
-    Serial.println("[ERROR] Camera/Web server start failed.");
+  if (!camera.begin()) {
+    Serial.println("CAMERA_INIT=FAILED");
     return;
   }
-
-  Serial.println("[OK] Connect your phone/PC to the Wi-Fi network above.");
-  Serial.println("[OK] Open the printed IP address in a browser.");
+  // SSID/password can be changed to your own values.
+  if (!web.begin(camera, "ESP32P4-Camera", "12345678")) {
+    Serial.println("WEB_INIT=FAILED");
+    return;
+  }
+  Serial.println("WEB_INIT=OK");
+  Serial.println("Connect your phone to ESP32P4-Camera, then open the IP shown above.");
 }
 
 void loop() {
-  cameraWeb.handleClient();
+  web.loop();
   delay(2);
 }
